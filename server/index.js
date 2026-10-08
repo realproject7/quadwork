@@ -1253,6 +1253,17 @@ app.post("/api/work-task-build", (req, res) => {
   }
 });
 
+// A revision-pinned Head recovery retires the stale local build or unreviewed
+// candidate after the registered clean base clone has advanced.
+app.post("/api/work-task-build/recover", (req, res) => {
+  const token = typeof req.get("X-Chat-Token") === "string" ? req.get("X-Chat-Token") : "";
+  try {
+    return res.json({ ok: true, ...workTaskBuildRuntime.recover({ token, body: req.body }) });
+  } catch (error) {
+    return res.status(409).json({ ok: false, code: error?.code || "work_task_stale_base_recovery_unavailable" });
+  }
+});
+
 // #1059 M4: these are fixed authenticated transport endpoints, rather than a
 // generic WorkTask mutation route.  The header token determines Head/reviewer
 // role and project; no route parameter or body field can change either.

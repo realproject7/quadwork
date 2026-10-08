@@ -40,6 +40,7 @@ const RECONCILE_RESOLUTIONS = new Set(["accepted", "changes_requested"]);
 const BLOCK_CODES = new Set(["dependency", "integrity", "validation"]);
 const EVENT_KINDS = new Set([
   "assign_build",
+  "recover_stale_base",
   "record_candidate",
   "replace_candidate",
   "assign_independent_review",
@@ -181,7 +182,7 @@ function assertCorrection(value, currentCandidate, state, count, code) {
 function assertSlot(slot, code) {
   const fields = ["work_task_ref", "dependency_refs", "file_boundary", "state", "candidate", "build_assignment", "review_assignment", "correction", "blocked_from", "history"];
   if (!plain(slot)) fail(code, "value must be an object");
-  exact(slot, [...fields, ...["correction_count", "invalidated_candidate"].filter((field) => Object.hasOwn(slot, field))], code);
+  exact(slot, [...fields, ...["correction_count", "invalidated_candidate", "last_build_assignment", "retired_builds"].filter((field) => Object.hasOwn(slot, field))], code);
   if (Object.hasOwn(slot, "invalidated_candidate")) {
     candidate(slot.invalidated_candidate, code);
     if (!sameRef(slot.invalidated_candidate.work_task_ref, slot.work_task_ref)) fail(code, "invalidated candidate belongs to another task");
@@ -204,6 +205,31 @@ function assertSlot(slot, code) {
   } else {
     assertAssignment(slot.build_assignment, code);
     if (slot.state !== "building") fail(code, "build assignment is not active in this state");
+  }
+  if (Object.hasOwn(slot, "last_build_assignment")) {
+    if (slot.last_build_assignment !== null) assertAssignment(slot.last_build_assignment, code);
+    if (slot.state === "building" && stable(slot.last_build_assignment) !== stable(slot.build_assignment)) {
+      fail(code, "build assignment audit identity is inconsistent");
+    }
+  }
+  if (Object.hasOwn(slot, "retired_builds")) {
+    if (!Array.isArray(slot.retired_builds) || slot.retired_builds.length > MAX_HISTORY) fail(code, "retired build history is invalid");
+    const retiredIds = new Set();
+    for (const entry of slot.retired_builds) {
+      exact(entry, ["event_id", "precondition_digest", "assignment", "candidate", "new_base_sha"], code);
+      identifier(entry.event_id, code);
+      if (retiredIds.has(entry.event_id) || !/^[a-f0-9]{64}$/.test(entry.precondition_digest)) fail(code, "retired build identity is invalid");
+      retiredIds.add(entry.event_id);
+      assertAssignment(entry.assignment, code);
+      sha(entry.new_base_sha, code);
+      if (entry.new_base_sha === entry.assignment.base_sha) fail(code, "retired build did not change base");
+      if (entry.candidate !== null) {
+        candidate(entry.candidate, code);
+        if (!sameRef(entry.candidate.work_task_ref, slot.work_task_ref) || entry.candidate.base_sha !== entry.assignment.base_sha) {
+          fail(code, "retired candidate is outside its assignment");
+        }
+      }
+    }
   }
   assertReviewAssignment(slot.review_assignment, slot.candidate, slot.state, code);
   const count = correctionCount(slot);
@@ -448,6 +474,17 @@ function parseEvent(pipeline, event) {
       exact(event, ["version", "kind", "event_id", "work_task_ref", "assignment_id", "base_sha"], code);
       if (event.version !== VERSION) fail(code, "event version is invalid");
       return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code), work_task_ref: canonicalTaskRef(pipeline, event.work_task_ref, code), assignment_id: identifier(event.assignment_id, code), base_sha: sha(event.base_sha, code) };
+    case "recover_stale_base":
+      exact(event, ["version", "kind", "event_id", "work_task_ref", "precondition_digest", "expected_assignment_id", "expected_base_sha", "expected_candidate_digest", "new_base_sha"], code);
+      if (event.version !== VERSION || !/^[a-f0-9]{64}$/.test(event.precondition_digest) ||
+          (event.expected_candidate_digest !== null && !/^[a-f0-9]{64}$/.test(event.expected_candidate_digest))) {
+        fail(code, "stale-base recovery event is invalid");
+      }
+      return { version: VERSION, kind: event.kind, event_id: identifier(event.event_id, code),
+        work_task_ref: canonicalTaskRef(pipeline, event.work_task_ref, code), precondition_digest: event.precondition_digest,
+        expected_assignment_id: identifier(event.expected_assignment_id, code),
+        expected_base_sha: sha(event.expected_base_sha, code), expected_candidate_digest: event.expected_candidate_digest,
+        new_base_sha: sha(event.new_base_sha, code) };
     case "record_candidate": {
       exact(event, ["version", "kind", "event_id", "assignment_id", "candidate"], code);
       if (event.version !== VERSION) fail(code, "event version is invalid");
@@ -631,6 +668,50 @@ function deriveTransition(pipeline, event) {
       slot.state = "building";
       slot.blocked_from = null;
       slot.build_assignment = { assignment_id: event.assignment_id, base_sha: event.base_sha };
+      slot.last_build_assignment = clone(slot.build_assignment);
+      effect(slot, from);
+      break;
+    }
+    case "recover_stale_base": {
+      if (archived || !pipeline.manifest_frozen || event.precondition_digest !== pipeline.pipeline_digest) {
+        fail("work_task_stale_base_recovery_stale", "recovery precondition is no longer current");
+      }
+      const slot = locate(event.work_task_ref);
+      if (slot.state !== "building" && slot.state !== "candidate_ready") {
+        fail("work_task_stale_base_recovery_unavailable", "task has active review or no recoverable build");
+      }
+      const currentAssignment = slot.build_assignment || slot.last_build_assignment ||
+        (slot.candidate === null ? null : {
+          assignment_id: "build_" + crypto.createHash("sha256").update(workTaskKey(slot.work_task_ref), "utf8").digest("hex").slice(0, 64),
+          base_sha: slot.candidate.base_sha,
+        });
+      if (!currentAssignment || currentAssignment.assignment_id !== event.expected_assignment_id ||
+          currentAssignment.base_sha !== event.expected_base_sha ||
+          (slot.candidate === null ? null : slot.candidate.candidate_digest) !== event.expected_candidate_digest ||
+          event.new_base_sha === event.expected_base_sha) {
+        fail("work_task_stale_base_recovery_stale", "build or candidate changed before recovery");
+      }
+      const root = repositoryBases.find((entry) => entry.repository_key === slot.work_task_ref.repository_key);
+      if (!root || root.base_sha !== event.expected_base_sha ||
+          (pipeline.deliveries || []).some((entry) => entry.candidate_ref.repository_key === slot.work_task_ref.repository_key) ||
+          tasks.some((entry) => entry !== slot && entry.work_task_ref.repository_key === slot.work_task_ref.repository_key &&
+            (entry.state !== "queued" || entry.candidate !== null || entry.correction !== null || entry.build_assignment !== null))) {
+        fail("work_task_stale_base_recovery_unavailable", "repository has other active or delivered WorkTasks");
+      }
+      const from = slot.state;
+      slot.retired_builds = [...(slot.retired_builds || []), {
+        event_id: event.event_id, precondition_digest: event.precondition_digest,
+        assignment: clone(currentAssignment), candidate: clone(slot.candidate), new_base_sha: event.new_base_sha,
+      }];
+      if (slot.retired_builds.length > MAX_HISTORY) fail("work_task_pipeline_history_full", "retired build history bound reached");
+      slot.state = "queued";
+      slot.candidate = null;
+      slot.build_assignment = null;
+      slot.last_build_assignment = null;
+      slot.review_assignment = null;
+      slot.correction = null;
+      slot.blocked_from = null;
+      root.base_sha = event.new_base_sha;
       effect(slot, from);
       break;
     }
@@ -647,6 +728,7 @@ function deriveTransition(pipeline, event) {
         fail("work_task_candidate_not_changed", "replacement candidate must be exact and new");
       }
       const from = slot.state;
+      slot.last_build_assignment = clone(slot.build_assignment);
       slot.candidate = clone(event.candidate);
       slot.state = "candidate_ready";
       slot.build_assignment = null;

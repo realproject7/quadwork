@@ -88,6 +88,18 @@ const DELIVERY_PREPARE_REJECTION_CODES = new Set([
   "delivery_candidate_evidence_invalid",
   "delivery_candidate_prepare_rejected",
 ]);
+const WORK_TASK_RECOVERY_REJECTION_CODES = new Set([
+  "work_task_build_principal_unavailable",
+  "stale_work_task_build_authority",
+  "invalid_work_task_build_recovery_request",
+  "work_task_stale_base_recovery_stale",
+  "work_task_stale_base_recovery_unavailable",
+  "work_task_build_base_unavailable",
+  "registered_work_task_base_dirty",
+  "stale_work_task_pipeline_store_precondition",
+  "work_task_build_event_conflict",
+  "work_task_archive_blocked",
+]);
 
 const CHAT_TOOLS = [
   {
@@ -273,6 +285,18 @@ const ASSIGN_WORK_TASK_BUILD_TOOL = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 };
 
+const RECOVER_WORK_TASK_BUILD_TOOL = {
+  name: "recover_work_task_build",
+  description: "Retire one stale-base build or unreviewed candidate at the exact pipeline digest. After the registered clean clone advances, assign the queued task again with a new event id. Existing evidence remains in the pipeline audit.",
+  inputSchema: {
+    type: "object",
+    properties: { event_id: { type: "string" }, work_task_ref: { type: "object" },
+      expected_pipeline_digest: { type: "string", pattern: "^[a-f0-9]{64}$" } },
+    required: ["event_id", "work_task_ref", "expected_pipeline_digest"], additionalProperties: false,
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 const OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL = {
   name: "open_work_task_independent_review",
   description: "Open the authenticated Head's exact WorkTask candidate for two independent reviewers. The server derives both reviewer roles, their current epoch, the project, and opening time; this does not reconcile, publish, or merge.",
@@ -447,6 +471,15 @@ function validDeliveryPrepareSuccess(body, submitted) {
   } catch { return false; }
 }
 
+function validWorkTaskRecoverySuccess(body, submitted) {
+  if (!plainRecord(body) || Object.keys(body).sort().join(",") !== "base_sha,ok,outcome,retired_assignment_id,version,work_task_ref" ||
+      body.ok !== true || body.version !== 1 || !["recovered", "idempotent"].includes(body.outcome) ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(body.base_sha) ||
+      !/^build_[a-f0-9]{64}$/.test(body.retired_assignment_id)) return false;
+  try { return workTaskKey(body.work_task_ref) === workTaskKey(submitted.work_task_ref); }
+  catch { return false; }
+}
+
 function parseChatResumeArguments(value) {
   if (!plainRecord(value)) return null;
   const keys = Object.keys(value).sort();
@@ -462,6 +495,7 @@ function toolsForActor() {
   if (AGENT === "head" && TOKEN) tools.push(
     CHAT_RESUME_TOOL,
     ASSIGN_WORK_TASK_BUILD_TOOL,
+    RECOVER_WORK_TASK_BUILD_TOOL,
     OPEN_WORK_TASK_INDEPENDENT_REVIEW_TOOL,
     RECONCILE_WORK_TASK_REVIEW_TOOL,
     PREPARE_DELIVERY_CANDIDATE_TOOL,
@@ -636,6 +670,28 @@ async function handleToolCall(id, name, params) {
       const res = await httpRequest("POST", "/api/work-task-build", params, { "X-Chat-Token": TOKEN });
       if (res.status >= 400) return jsonRpcError(id, -32000, "WorkTask build assignment unavailable");
       return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify(res.body) }] });
+    }
+
+    if (name === "recover_work_task_build") {
+      if (AGENT !== "head" || !TOKEN) return jsonRpcError(id, -32601, "Unknown tool: recover_work_task_build");
+      try {
+        const res = await httpRequest("POST", "/api/work-task-build/recover", params, { "X-Chat-Token": TOKEN });
+        if (res.status >= 400) {
+          const code = plainRecord(res.body) && res.body.ok === false &&
+            WORK_TASK_RECOVERY_REJECTION_CODES.has(res.body.code) ? res.body.code : "WorkTask build recovery unavailable";
+          return jsonRpcError(id, -32000, code);
+        }
+        if (res.status !== 200 || !validWorkTaskRecoverySuccess(res.body, params)) {
+          return jsonRpcError(id, -32000, "WorkTask build recovery unavailable");
+        }
+        const body = res.body;
+        return jsonRpc(id, { content: [{ type: "text", text: JSON.stringify({
+          ok: true, version: 1, outcome: body.outcome, work_task_ref: body.work_task_ref,
+          retired_assignment_id: body.retired_assignment_id, base_sha: body.base_sha,
+        }) }] });
+      } catch {
+        return jsonRpcError(id, -32000, "WorkTask build recovery unavailable");
+      }
     }
 
     if (name === "open_work_task_independent_review") {

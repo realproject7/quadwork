@@ -37,6 +37,12 @@ you act as the human operator by talking to them.
 > first** (see [Registration](#registration)); do **not** fall back to SSH or
 > curl. No tools = not connected, not a reason to hand-operate.
 
+## V2 stale-base build recovery
+
+If the default branch moves after a V2 build assignment, ask Head in project Primary Chat to use its Head-only recover_work_task_build tool. First update the registered clean base clone to the intended current commit. Head reads the current pipeline status and supplies its exact pipeline digest, the WorkTask reference, and a new event ID. The server retires the old build or unreviewed candidate, preserves the audit snapshot, and returns that task to queued. Head then uses assign_work_task_build with another new event ID; the server pins the observed clone HEAD and issues a different Dev assignment.
+
+Recovery refuses active review, another progressed task in the same repository, delivered work in that repository, a dirty clone, or a stale pipeline digest. Retry the same recovery event ID after an interrupted response. Do not resubmit the old candidate or reset the project.
+
 ## Registration
 
 The package installs a dedicated bin, `quadwork-mcp-operator`. Always register with the bin (never a `<quadwork-dir>/server/...` path — that breaks on global/VPS installs). Every client launches the **same** command — `quadwork-mcp-operator --port <port>` — only the registration syntax differs. Examples for common clients follow; any MCP client that can launch a stdio server works the same way.

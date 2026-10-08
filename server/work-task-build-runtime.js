@@ -78,7 +78,7 @@ function sameLiveIdentity(ref, identity) {
 
 function createWorkTaskBuildRuntime(value) {
   const deps = options(value);
-  function activeHead(rawToken) {
+  function activeHead(rawToken, requireDev = true) {
     let principal;
     try { principal = deps.resolve_shim_principal(token(rawToken)); }
     catch { fail("work_task_build_principal_unavailable", "build principal is unavailable"); }
@@ -95,8 +95,8 @@ function createWorkTaskBuildRuntime(value) {
     const dev = deps.agent_sessions.get(`${principal.projectId}/dev`);
     const verified = (session, role) => session && session.projectId === principal.projectId && session.agentId === role &&
       session.state === "running" && !!session.term && session.lifecycleState === "verified";
-    if (!current || !verified(head, "head") || !verified(dev, "dev")) {
-      fail("work_task_build_principal_unavailable", "Head and Dev must both be verified");
+    if (!current || !verified(head, "head") || (requireDev && !verified(dev, "dev"))) {
+      fail("work_task_build_principal_unavailable", "required agent session is not verified");
     }
     return freeze({ project_id: principal.projectId });
   }
@@ -144,7 +144,30 @@ function createWorkTaskBuildRuntime(value) {
       fail(safeCode(error, "work_task_build_assignment_unavailable"), "build assignment is unavailable");
     }
   }
-  return freeze({ assign });
+  function recover(rawRequest) {
+    if (!plain(rawRequest)) fail("invalid_work_task_build_runtime_request", "build recovery request is invalid");
+    const principal = activeHead(rawRequest.token, false);
+    const ref = reference(rawRequest.body?.work_task_ref);
+    if (ref.project_id !== principal.project_id) fail("stale_work_task_build_authority", "WorkTask project is not current");
+    assertLiveCurrent(ref);
+    let service;
+    try {
+      service = deps.create_assignment_service({
+        config_dir: deps.config_dir,
+        fs: deps.fs,
+        read_registered_base: (request) => deps.read_registered_base(principal.project_id, request),
+      });
+    } catch (error) {
+      fail(safeCode(error, "work_task_build_service_unavailable"), "build recovery service is unavailable");
+    }
+    try {
+      return service.recoverStaleBase({ version: VERSION, event_id: rawRequest.body?.event_id,
+        work_task_ref: ref, expected_pipeline_digest: rawRequest.body?.expected_pipeline_digest });
+    } catch (error) {
+      fail(safeCode(error, "work_task_stale_base_recovery_unavailable"), "build recovery is unavailable");
+    }
+  }
+  return freeze({ assign, recover });
 }
 
 module.exports = {

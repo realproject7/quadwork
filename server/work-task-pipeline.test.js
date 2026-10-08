@@ -320,6 +320,36 @@ function moveToAccepted(pipeline, taskRef, marker, prefix) {
   })), "stale_work_task_candidate");
 }
 
+// A queued correction still owns an old-base candidate. Advancing the shared
+// repository root for another task would make that correction impossible.
+{
+  const batch = manifestForTasks([sourceTask("rework", "api", 40), sourceTask("fresh", "api", 41)]);
+  const [rework, fresh] = batch.tasks.map((entry) => entry.ref);
+  const old = candidateFor(rework, "b");
+  let work = buildWorkTaskPipeline(batch);
+  work = apply(work, event("assign_build", "stale_rework_build", { work_task_ref: copy(rework), assignment_id: "stale_rework_assignment" }));
+  work = apply(work, event("record_candidate", "stale_rework_candidate", { assignment_id: "stale_rework_assignment", candidate: old }));
+  work = apply(work, event("assign_independent_review", "stale_rework_review", {
+    work_task_ref: copy(rework), review_round_id: "stale_rework_round", candidate_digest: old.candidate_digest,
+  }));
+  work = apply(work, event("record_review_verdict", "stale_rework_verdict", {
+    work_task_ref: copy(rework), review_round_id: "stale_rework_round", candidate_digest: old.candidate_digest, verdict: "changes_requested",
+  }));
+  work = apply(work, event("reconcile_review", "stale_rework_reconcile", {
+    work_task_ref: copy(rework), review_round_id: "stale_rework_round", candidate_digest: old.candidate_digest, resolution: "changes_requested",
+  }));
+  work = apply(work, event("queue_local_correction", "stale_rework_checkpoint", {
+    work_task_ref: copy(rework), checkpoint_id: "stale_rework_checkpoint_id",
+  }));
+  work = apply(work, event("assign_build", "stale_fresh_build", { work_task_ref: copy(fresh), assignment_id: "stale_fresh_assignment" }));
+  throwsCode(() => planWorkTaskPipelineEvent(work, event("recover_stale_base", "stale_fresh_recover", {
+    work_task_ref: copy(fresh), precondition_digest: work.pipeline_digest,
+    expected_assignment_id: "stale_fresh_assignment", expected_base_sha: base_sha,
+    expected_candidate_digest: null, new_base_sha: "f".repeat(64),
+  })), "work_task_stale_base_recovery_unavailable");
+  assert.equal(slot(work, rework).candidate.candidate_digest, old.candidate_digest);
+}
+
 // #1070: the local correction cap is a per-task fact, not a property of the
 // active checkpoint. Three corrections may be queued for one task; the fourth
 // is refused before any plan exists, even though every corrected candidate
